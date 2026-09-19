@@ -17,6 +17,7 @@ app.get('/', (req, res) => {
 });
 
 const YTDLP = process.env.YTDLP_PATH || 'yt-dlp';
+const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
 function runYtDlp(args, timeoutMs = 100000) {
   return new Promise((resolve, reject) => {
@@ -30,15 +31,47 @@ function runYtDlp(args, timeoutMs = 100000) {
   });
 }
 
+// Try multiple yt-dlp strategies until one works
+async function tryYtDlp(url, extraArgs = [], timeoutMs = 100000) {
+  // Strategy list — different YouTube clients handle bot-detection differently
+  const strategies = [
+    ['--extractor-args', 'youtube:player_client=android,web,ios'],
+    ['--extractor-args', 'youtube:player_client=ios,web'],
+    ['--extractor-args', 'youtube:player_client=tv_embedded,web'],
+    ['--extractor-args', 'youtube:player_client=mweb,web'],
+    []
+  ];
+
+  let lastErr = null;
+  for (const extra of strategies) {
+    try {
+      const args = [
+        ...extraArgs,
+        '--no-warnings',
+        '--no-playlist',
+        '--no-check-certificate',
+        '--user-agent', USER_AGENT,
+        '--geo-bypass',
+        ...extra,
+        url
+      ];
+      const out = await runYtDlp(args, timeoutMs);
+      return out;
+    } catch (e) {
+      lastErr = e;
+      // If it's not a YouTube URL, no point retrying other clients
+      if (!/youtube|youtu\.be/i.test(url)) break;
+    }
+  }
+  throw lastErr || new Error('All strategies failed');
+}
+
 app.post('/api/info', async (req, res) => {
   const { url } = req.body || {};
   if (!url) return res.status(400).json({ ok: false, error: 'url required' });
 
   try {
-    const stdout = await runYtDlp([
-      '-j', '--no-warnings', '--no-playlist', '--no-check-certificate', url
-    ], 100000);
-
+    const stdout = await tryYtDlp(url, ['-j'], 100000);
     const info = JSON.parse(stdout);
 
     const formats = (info.formats || []).map((f, i) => ({
@@ -79,22 +112,17 @@ app.post('/api/download', async (req, res) => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dl-'));
     const outputTemplate = path.join(tmpDir, '%(title).80s.%(ext)s');
 
-    const args = [
-      '--no-warnings', '--no-playlist', '--no-check-certificate',
-      '-o', outputTemplate
-    ];
-
+    const baseArgs = ['-o', outputTemplate];
     if (format && format !== 'auto' && format !== '') {
-      args.push('-f', format);
+      baseArgs.push('-f', format);
     } else {
-      args.push('-f', 'best');
+      baseArgs.push('-f', 'best');
     }
 
-    args.push(url);
-    await runYtDlp(args, 170000);
+    await tryYtDlp(url, baseArgs, 170000);
 
     const files = fs.readdirSync(tmpDir);
-    if (!files.length) throw new Error('Download failed');
+    if (!files.length) throw new Error('Download failed — no file');
 
     const filePath = path.join(tmpDir, files[0]);
     const token = crypto.randomBytes(16).toString('hex');
@@ -120,7 +148,6 @@ app.get('/api/file/:token', (req, res) => {
     try { fs.unlinkSync(rec.path); } catch(e){}
     return res.status(410).send('File expired');
   }
-
   res.download(rec.path, rec.name, () => {
     tempFiles.delete(req.params.token);
     try { fs.unlinkSync(rec.path); } catch(e){}
