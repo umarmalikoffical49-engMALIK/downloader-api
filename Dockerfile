@@ -5,7 +5,7 @@ RUN apt-get update && apt-get install -y \
     ffmpeg \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y nodejs \
-    && pip install --no-cache-dir yt-dlp \
+    && pip install --no-cache-dir -U --pre "yt-dlp[default]" \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
