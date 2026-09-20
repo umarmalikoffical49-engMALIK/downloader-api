@@ -9,7 +9,12 @@ const crypto = require('crypto');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(cors());
+app.use(cors({
+  origin: '*',
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Accept', 'Range'],
+  exposedHeaders: ['Content-Length', 'Content-Range', 'Content-Disposition', 'Accept-Ranges']
+}));
 app.use(express.json({ limit: '5mb' }));
 
 const YTDLP = process.env.YTDLP_PATH || 'yt-dlp';
@@ -47,7 +52,6 @@ function commonArgs() {
 
 async function tryYtDlp(url, extraArgs = [], timeoutMs = 180000) {
   const isYT = /youtube|youtu\.be/i.test(url);
-
   const strategies = isYT ? [
     ['--extractor-args', 'youtube:player_client=android_vr,mweb;player_skip=webpage'],
     ['--extractor-args', 'youtube:player_client=ios,mweb'],
@@ -61,7 +65,6 @@ async function tryYtDlp(url, extraArgs = [], timeoutMs = 180000) {
   ] : [[]];
 
   let lastErr = null;
-
   for (let i = 0; i < strategies.length; i++) {
     try {
       const args = [...extraArgs, ...commonArgs(), ...strategies[i], url];
@@ -75,7 +78,6 @@ async function tryYtDlp(url, extraArgs = [], timeoutMs = 180000) {
       if (!isYT) break;
     }
   }
-
   throw lastErr || new Error('All strategies failed');
 }
 
@@ -84,7 +86,7 @@ app.get('/', (req, res) => {
     ok: true,
     message: 'Downloader API is running',
     cookies: hasCookies() ? 'loaded' : 'not loaded',
-    version: '2.1'
+    version: '2.2'
   });
 });
 
@@ -132,40 +134,23 @@ app.post('/api/download', async (req, res) => {
 
   try {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dl-'));
-    // Use proper filename template so file names come from title
     const outputTemplate = path.join(tmpDir, '%(title).80s.%(ext)s');
 
     const dlArgs = ['-o', outputTemplate];
-
-    // ========== FORMAT SELECTION LOGIC ==========
-    // If auto → best video + best audio, merged to mp4
-    // If specific format ID → try that format + best audio, fallback to best
     const f = (format || 'auto').trim().toLowerCase();
 
-    if (f === 'auto' || f === '') {
-      // Best video + best audio that has both, or best combined
+    if (f === 'auto' || f === 'best' || f === '') {
       dlArgs.push('-f', 'bv*+ba/b');
-      dlArgs.push('--merge-output-format', 'mp4');
-    } else if (f === 'best') {
-      dlArgs.push('-f', 'bv*+ba/b');
-      dlArgs.push('--merge-output-format', 'mp4');
     } else {
-      // Specific format ID from frontend.
-      // Try: <id>+bestaudio  →  <id>  →  best
       dlArgs.push('-f', `${format}+ba/${format}/bv*+ba/b`);
-      dlArgs.push('--merge-output-format', 'mp4');
     }
-
-    // Always prefer mp4 container and prefer bigger resolution if merging
     dlArgs.push('--merge-output-format', 'mp4');
 
     await tryYtDlp(url, dlArgs, 170000);
 
-    // Find produced file (ignore .part)
-    const allFiles = fs.readdirSync(tmpDir).filter(f => !f.endsWith('.part') && !f.startsWith('.'));
+    const allFiles = fs.readdirSync(tmpDir).filter(fn => !fn.endsWith('.part') && !fn.startsWith('.'));
     if (!allFiles.length) throw new Error('Download failed — no file produced');
 
-    // Pick the biggest file (in case of multiple outputs)
     let biggest = null;
     let biggestSize = 0;
     for (const fn of allFiles) {
@@ -179,37 +164,11 @@ app.post('/api/download', async (req, res) => {
 
     if (!biggest || biggestSize < 1000) throw new Error('File too small — download failed');
 
-    // Warn if we accidentally only got audio (video mode should not produce .mp3/.m4a)
-    const ext = path.extname(biggest.name).toLowerCase();
-    const isAudioExt = ['.mp3', '.m4a', '.opus', '.ogg', '.wav', '.aac'].includes(ext);
-
-    if (isAudioExt && f !== 'auto' && f !== 'best') {
-      // Attempted video but got audio — try one more time forcing video
-      console.log('[retry] Got audio-only, forcing bestvideo...');
-      // cleanup tmpDir
-      try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (e) {}
-      // Try again with strict video format
-      const tmpDir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'dl2-'));
-      const out2 = path.join(tmpDir2, '%(title).80s.%(ext)s');
-      const args2 = ['-o', out2, '-f', 'bv*+ba/b', '--merge-output-format', 'mp4'];
-      await tryYtDlp(url, args2, 170000);
-      const files2 = fs.readdirSync(tmpDir2).filter(x => !x.endsWith('.part'));
-      if (!files2.length) throw new Error('Video format not available for this URL');
-      let b2 = null, s2 = 0;
-      for (const fn of files2) {
-        const st = fs.statSync(path.join(tmpDir2, fn));
-        if (st.size > s2) { s2 = st.size; b2 = { path: path.join(tmpDir2, fn), name: fn }; }
-      }
-      biggest = b2;
-      biggestSize = s2;
-      // update tmpDir path for cleanup
-    }
-
     const token = crypto.randomBytes(16).toString('hex');
     tempFiles.set(token, {
       path: biggest.path,
       name: biggest.name,
-      expires: Date.now() + 15 * 60 * 1000
+      expires: Date.now() + 20 * 60 * 1000
     });
 
     const baseUrl = `${req.protocol}://${req.get('host')}`;
@@ -221,7 +180,22 @@ app.post('/api/download', async (req, res) => {
   }
 });
 
+// ============ FILE ROUTE WITH FULL CORS ============
+app.options('/api/file/:token', (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Range, Accept');
+  res.setHeader('Access-Control-Max-Age', '86400');
+  res.sendStatus(204);
+});
+
 app.get('/api/file/:token', (req, res) => {
+  // CORS headers FIRST
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Range, Accept');
+  res.setHeader('Access-Control-Expose-Headers', 'Content-Length, Content-Disposition, Content-Type');
+
   const rec = tempFiles.get(req.params.token);
   if (!rec) return res.status(404).send('File not found or expired');
   if (Date.now() > rec.expires) {
@@ -234,8 +208,11 @@ app.get('/api/file/:token', (req, res) => {
     return res.status(404).send('File already deleted');
   }
 
-  res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(rec.name)}"`);
+  const stat = fs.statSync(rec.path);
   res.setHeader('Content-Type', 'application/octet-stream');
+  res.setHeader('Content-Length', stat.size);
+  res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(rec.name)}"`);
+  res.setHeader('Accept-Ranges', 'bytes');
 
   const stream = fs.createReadStream(rec.path);
   stream.pipe(res);
