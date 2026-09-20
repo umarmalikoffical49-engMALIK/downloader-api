@@ -9,12 +9,9 @@ const crypto = require('crypto');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(cors({
-  origin: '*',
-  methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Accept', 'Range'],
-  exposedHeaders: ['Content-Length', 'Content-Range', 'Content-Disposition', 'Accept-Ranges']
-}));
+// Full CORS
+app.use(cors());
+app.options('*', cors());
 app.use(express.json({ limit: '5mb' }));
 
 const YTDLP = process.env.YTDLP_PATH || 'yt-dlp';
@@ -36,16 +33,8 @@ function runYtDlp(args, timeoutMs = 180000) {
 }
 
 function commonArgs() {
-  const a = [
-    '--no-warnings',
-    '--no-playlist',
-    '--no-check-certificate',
-    '--geo-bypass',
-    '--user-agent', UA,
-    '--retries', '3',
-    '--socket-timeout', '30',
-    '--no-cache-dir'
-  ];
+  const a = ['--no-warnings','--no-playlist','--no-check-certificate','--geo-bypass',
+    '--user-agent', UA,'--retries','3','--socket-timeout','30','--no-cache-dir'];
   if (hasCookies()) a.push('--cookies', COOKIES_FILE);
   return a;
 }
@@ -82,44 +71,26 @@ async function tryYtDlp(url, extraArgs = [], timeoutMs = 180000) {
 }
 
 app.get('/', (req, res) => {
-  res.json({
-    ok: true,
-    message: 'Downloader API is running',
-    cookies: hasCookies() ? 'loaded' : 'not loaded',
-    version: '2.2'
-  });
+  res.json({ ok: true, message: 'Downloader API is running', cookies: hasCookies() ? 'loaded' : 'not loaded', version: '3.0' });
 });
 
 app.post('/api/info', async (req, res) => {
   const { url } = req.body || {};
   if (!url) return res.status(400).json({ ok: false, error: 'url required' });
-
   try {
     const stdout = await tryYtDlp(url, ['-j'], 120000);
     const info = JSON.parse(stdout);
-
     const formats = (info.formats || []).map((f, i) => ({
-      id: f.format_id || String(i),
-      ext: f.ext,
+      id: f.format_id || String(i), ext: f.ext,
       quality: f.format_note || f.resolution || (f.height ? f.height + 'p' : f.format_id),
-      resolution: f.resolution,
-      height: f.height,
-      vCodec: f.vcodec,
-      aCodec: f.acodec,
-      filesize: f.filesize || f.filesize_approx,
-      format_note: f.format_note
+      resolution: f.resolution, height: f.height,
+      vCodec: f.vcodec, aCodec: f.acodec,
+      filesize: f.filesize || f.filesize_approx, format_note: f.format_note
     }));
-
-    res.json({
-      ok: true,
-      data: {
-        title: info.title,
-        thumbnailUrl: info.thumbnail,
-        duration: info.duration,
-        uploader: info.uploader,
-        formats
-      }
-    });
+    res.json({ ok: true, data: {
+      title: info.title, thumbnailUrl: info.thumbnail,
+      duration: info.duration, uploader: info.uploader, formats
+    }});
   } catch (e) {
     console.error('[info]', e.message);
     res.status(500).json({ ok: false, error: { message: e.message } });
@@ -135,7 +106,6 @@ app.post('/api/download', async (req, res) => {
   try {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dl-'));
     const outputTemplate = path.join(tmpDir, '%(title).80s.%(ext)s');
-
     const dlArgs = ['-o', outputTemplate];
     const f = (format || 'auto').trim().toLowerCase();
 
@@ -149,27 +119,18 @@ app.post('/api/download', async (req, res) => {
     await tryYtDlp(url, dlArgs, 170000);
 
     const allFiles = fs.readdirSync(tmpDir).filter(fn => !fn.endsWith('.part') && !fn.startsWith('.'));
-    if (!allFiles.length) throw new Error('Download failed — no file produced');
+    if (!allFiles.length) throw new Error('No file produced');
 
-    let biggest = null;
-    let biggestSize = 0;
+    let biggest = null, biggestSize = 0;
     for (const fn of allFiles) {
       const fp = path.join(tmpDir, fn);
       const st = fs.statSync(fp);
-      if (st.size > biggestSize) {
-        biggestSize = st.size;
-        biggest = { path: fp, name: fn };
-      }
+      if (st.size > biggestSize) { biggestSize = st.size; biggest = { path: fp, name: fn }; }
     }
-
-    if (!biggest || biggestSize < 1000) throw new Error('File too small — download failed');
+    if (!biggest || biggestSize < 1000) throw new Error('File too small');
 
     const token = crypto.randomBytes(16).toString('hex');
-    tempFiles.set(token, {
-      path: biggest.path,
-      name: biggest.name,
-      expires: Date.now() + 20 * 60 * 1000
-    });
+    tempFiles.set(token, { path: biggest.path, name: biggest.name, expires: Date.now() + 20 * 60 * 1000 });
 
     const baseUrl = `${req.protocol}://${req.get('host')}`;
     console.log(`[download] ready: ${biggest.name} (${(biggestSize / 1024 / 1024).toFixed(2)} MB)`);
@@ -180,45 +141,27 @@ app.post('/api/download', async (req, res) => {
   }
 });
 
-// ============ FILE ROUTE WITH FULL CORS ============
-app.options('/api/file/:token', (req, res) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Range, Accept');
-  res.setHeader('Access-Control-Max-Age', '86400');
-  res.sendStatus(204);
-});
-
+// ============ FILE DOWNLOAD (SIMPLE + RELIABLE) ============
 app.get('/api/file/:token', (req, res) => {
-  // CORS headers FIRST
+  // CORS
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Range, Accept');
-  res.setHeader('Access-Control-Expose-Headers', 'Content-Length, Content-Disposition, Content-Type');
+  res.setHeader('Access-Control-Allow-Headers', '*');
+  res.setHeader('Access-Control-Expose-Headers', '*');
 
   const rec = tempFiles.get(req.params.token);
-  if (!rec) return res.status(404).send('File not found or expired');
+  if (!rec) return res.status(404).send('File not found');
   if (Date.now() > rec.expires) {
     tempFiles.delete(req.params.token);
     try { fs.unlinkSync(rec.path); } catch (e) {}
     return res.status(410).send('File expired');
   }
-  if (!fs.existsSync(rec.path)) {
-    tempFiles.delete(req.params.token);
-    return res.status(404).send('File already deleted');
-  }
+  if (!fs.existsSync(rec.path)) return res.status(404).send('File gone');
 
-  const stat = fs.statSync(rec.path);
-  res.setHeader('Content-Type', 'application/octet-stream');
-  res.setHeader('Content-Length', stat.size);
-  res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(rec.name)}"`);
-  res.setHeader('Accept-Ranges', 'bytes');
-
-  const stream = fs.createReadStream(rec.path);
-  stream.pipe(res);
-  stream.on('error', (err) => {
-    console.error('Stream error:', err);
-    if (!res.headersSent) res.status(500).end();
+  // Use express res.download — sets Content-Disposition properly
+  // DON'T delete file — allows retry. Cleanup via interval.
+  res.download(rec.path, rec.name, (err) => {
+    if (err) console.error('Download err:', err.message);
   });
 });
 
@@ -234,7 +177,7 @@ setInterval(() => {
 
 try {
   const tmp = os.tmpdir();
-  const old = fs.readdirSync(tmp).filter(f => f.startsWith('dl-') || f.startsWith('dl2-'));
+  const old = fs.readdirSync(tmp).filter(f => f.startsWith('dl-'));
   for (const f of old) {
     try { fs.rmSync(path.join(tmp, f), { recursive: true, force: true }); } catch (e) {}
   }
