@@ -15,7 +15,6 @@ app.use(express.json({ limit: '5mb' }));
 const YTDLP = process.env.YTDLP_PATH || 'yt-dlp';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36';
 
-// Optional cookies.txt — if uploaded, used automatically
 const COOKIES_FILE = path.join(__dirname, 'cookies.txt');
 const hasCookies = () => fs.existsSync(COOKIES_FILE);
 
@@ -46,13 +45,10 @@ function commonArgs() {
   return a;
 }
 
-// ============ YOUTUBE FALLBACK STRATEGIES ============
 async function tryYtDlp(url, extraArgs = [], timeoutMs = 180000) {
   const isYT = /youtube|youtu\.be/i.test(url);
 
-  // Try each strategy — some work when others don't
   const strategies = isYT ? [
-    // Try latest trick first (mweb + android_vr combination)
     ['--extractor-args', 'youtube:player_client=android_vr,mweb;player_skip=webpage'],
     ['--extractor-args', 'youtube:player_client=ios,mweb'],
     ['--extractor-args', 'youtube:player_client=tv_embedded,web_embedded'],
@@ -61,7 +57,7 @@ async function tryYtDlp(url, extraArgs = [], timeoutMs = 180000) {
     ['--extractor-args', 'youtube:player_client=mweb'],
     ['--extractor-args', 'youtube:player_skip=webpage,configs;player_client=android_vr'],
     ['--extractor-args', 'youtube:player_client=android,ios'],
-    [] // Default fallback
+    []
   ] : [[]];
 
   let lastErr = null;
@@ -75,9 +71,7 @@ async function tryYtDlp(url, extraArgs = [], timeoutMs = 180000) {
       return result;
     } catch (e) {
       lastErr = e;
-      const msg = (e.message || '').substring(0, 150);
-      console.log(`[strategy ${i + 1}] FAILED: ${msg}`);
-      // If not YouTube, no point retrying
+      console.log(`[strategy ${i + 1}] FAILED: ${(e.message || '').substring(0, 140)}`);
       if (!isYT) break;
     }
   }
@@ -90,7 +84,7 @@ app.get('/', (req, res) => {
     ok: true,
     message: 'Downloader API is running',
     cookies: hasCookies() ? 'loaded' : 'not loaded',
-    version: '2.0'
+    version: '2.1'
   });
 });
 
@@ -138,57 +132,95 @@ app.post('/api/download', async (req, res) => {
 
   try {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dl-'));
-    const outputTemplate = path.join(tmpDir, 'media.%(ext)s');
+    // Use proper filename template so file names come from title
+    const outputTemplate = path.join(tmpDir, '%(title).80s.%(ext)s');
 
     const dlArgs = ['-o', outputTemplate];
 
-    if (format && format !== 'auto' && format !== '') {
-      // Smart format selection — try to merge with audio if possible
-      dlArgs.push('-f', `${format}+bestaudio/${format}/best`);
+    // ========== FORMAT SELECTION LOGIC ==========
+    // If auto → best video + best audio, merged to mp4
+    // If specific format ID → try that format + best audio, fallback to best
+    const f = (format || 'auto').trim().toLowerCase();
+
+    if (f === 'auto' || f === '') {
+      // Best video + best audio that has both, or best combined
+      dlArgs.push('-f', 'bv*+ba/b');
+      dlArgs.push('--merge-output-format', 'mp4');
+    } else if (f === 'best') {
+      dlArgs.push('-f', 'bv*+ba/b');
+      dlArgs.push('--merge-output-format', 'mp4');
     } else {
-      // Best video + best audio, merged to mp4
-      dlArgs.push('-f', 'bestvideo+bestaudio/best');
+      // Specific format ID from frontend.
+      // Try: <id>+bestaudio  →  <id>  →  best
+      dlArgs.push('-f', `${format}+ba/${format}/bv*+ba/b`);
+      dlArgs.push('--merge-output-format', 'mp4');
     }
 
+    // Always prefer mp4 container and prefer bigger resolution if merging
     dlArgs.push('--merge-output-format', 'mp4');
 
     await tryYtDlp(url, dlArgs, 170000);
 
-    // Look for the produced file
-    const files = fs.readdirSync(tmpDir).filter(f => !f.endsWith('.part') && !f.startsWith('.'));
-    if (!files.length) throw new Error('Download failed — no file produced');
+    // Find produced file (ignore .part)
+    const allFiles = fs.readdirSync(tmpDir).filter(f => !f.endsWith('.part') && !f.startsWith('.'));
+    if (!allFiles.length) throw new Error('Download failed — no file produced');
 
-    // Pick the biggest file (in case of multiple)
+    // Pick the biggest file (in case of multiple outputs)
     let biggest = null;
     let biggestSize = 0;
-    for (const f of files) {
-      const fp = path.join(tmpDir, f);
+    for (const fn of allFiles) {
+      const fp = path.join(tmpDir, fn);
       const st = fs.statSync(fp);
       if (st.size > biggestSize) {
         biggestSize = st.size;
-        biggest = { path: fp, name: f };
+        biggest = { path: fp, name: fn };
       }
     }
 
     if (!biggest || biggestSize < 1000) throw new Error('File too small — download failed');
 
+    // Warn if we accidentally only got audio (video mode should not produce .mp3/.m4a)
+    const ext = path.extname(biggest.name).toLowerCase();
+    const isAudioExt = ['.mp3', '.m4a', '.opus', '.ogg', '.wav', '.aac'].includes(ext);
+
+    if (isAudioExt && f !== 'auto' && f !== 'best') {
+      // Attempted video but got audio — try one more time forcing video
+      console.log('[retry] Got audio-only, forcing bestvideo...');
+      // cleanup tmpDir
+      try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (e) {}
+      // Try again with strict video format
+      const tmpDir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'dl2-'));
+      const out2 = path.join(tmpDir2, '%(title).80s.%(ext)s');
+      const args2 = ['-o', out2, '-f', 'bv*+ba/b', '--merge-output-format', 'mp4'];
+      await tryYtDlp(url, args2, 170000);
+      const files2 = fs.readdirSync(tmpDir2).filter(x => !x.endsWith('.part'));
+      if (!files2.length) throw new Error('Video format not available for this URL');
+      let b2 = null, s2 = 0;
+      for (const fn of files2) {
+        const st = fs.statSync(path.join(tmpDir2, fn));
+        if (st.size > s2) { s2 = st.size; b2 = { path: path.join(tmpDir2, fn), name: fn }; }
+      }
+      biggest = b2;
+      biggestSize = s2;
+      // update tmpDir path for cleanup
+    }
+
     const token = crypto.randomBytes(16).toString('hex');
     tempFiles.set(token, {
       path: biggest.path,
       name: biggest.name,
-      expires: Date.now() + 15 * 60 * 1000  // 15 min to allow retry
+      expires: Date.now() + 15 * 60 * 1000
     });
 
     const baseUrl = `${req.protocol}://${req.get('host')}`;
     console.log(`[download] ready: ${biggest.name} (${(biggestSize / 1024 / 1024).toFixed(2)} MB)`);
-    res.json({ ok: true, url: `${baseUrl}/api/file/${token}`, size: biggestSize });
+    res.json({ ok: true, url: `${baseUrl}/api/file/${token}`, size: biggestSize, filename: biggest.name });
   } catch (e) {
     console.error('[download]', e.message);
     res.status(500).json({ ok: false, error: { message: e.message } });
   }
 });
 
-// Serve the file — allow multiple downloads of same token
 app.get('/api/file/:token', (req, res) => {
   const rec = tempFiles.get(req.params.token);
   if (!rec) return res.status(404).send('File not found or expired');
@@ -202,7 +234,6 @@ app.get('/api/file/:token', (req, res) => {
     return res.status(404).send('File already deleted');
   }
 
-  // Force download with proper headers
   res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(rec.name)}"`);
   res.setHeader('Content-Type', 'application/octet-stream');
 
@@ -212,25 +243,21 @@ app.get('/api/file/:token', (req, res) => {
     console.error('Stream error:', err);
     if (!res.headersSent) res.status(500).end();
   });
-  // DO NOT delete here — allow retries. Cleanup happens via interval
 });
 
-// Cleanup expired files every 5 minutes
 setInterval(() => {
   const now = Date.now();
   for (const [token, rec] of tempFiles.entries()) {
     if (now > rec.expires) {
       try { fs.unlinkSync(rec.path); } catch (e) {}
       tempFiles.delete(token);
-      console.log('[cleanup] removed expired:', rec.name);
     }
   }
 }, 5 * 60 * 1000);
 
-// Also clean up old temp dirs on startup
 try {
   const tmp = os.tmpdir();
-  const old = fs.readdirSync(tmp).filter(f => f.startsWith('dl-'));
+  const old = fs.readdirSync(tmp).filter(f => f.startsWith('dl-') || f.startsWith('dl2-'));
   for (const f of old) {
     try { fs.rmSync(path.join(tmp, f), { recursive: true, force: true }); } catch (e) {}
   }
