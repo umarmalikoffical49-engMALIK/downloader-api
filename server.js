@@ -9,7 +9,6 @@ const crypto = require('crypto');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Full CORS
 app.use(cors());
 app.options('*', cors());
 app.use(express.json({ limit: '5mb' }));
@@ -71,7 +70,7 @@ async function tryYtDlp(url, extraArgs = [], timeoutMs = 180000) {
 }
 
 app.get('/', (req, res) => {
-  res.json({ ok: true, message: 'Downloader API is running', cookies: hasCookies() ? 'loaded' : 'not loaded', version: '3.0' });
+  res.json({ ok: true, message: 'Downloader API is running', cookies: hasCookies() ? 'loaded' : 'not loaded', version: '3.1' });
 });
 
 app.post('/api/info', async (req, res) => {
@@ -132,7 +131,9 @@ app.post('/api/download', async (req, res) => {
     const token = crypto.randomBytes(16).toString('hex');
     tempFiles.set(token, { path: biggest.path, name: biggest.name, expires: Date.now() + 20 * 60 * 1000 });
 
-    const baseUrl = `${req.protocol}://${req.get('host')}`;
+    // ============ FORCE HTTPS ============
+    const host = req.get('host');
+    const baseUrl = `https://${host}`;
     console.log(`[download] ready: ${biggest.name} (${(biggestSize / 1024 / 1024).toFixed(2)} MB)`);
     res.json({ ok: true, url: `${baseUrl}/api/file/${token}`, size: biggestSize, filename: biggest.name });
   } catch (e) {
@@ -141,13 +142,10 @@ app.post('/api/download', async (req, res) => {
   }
 });
 
-// ============ FILE DOWNLOAD (SIMPLE + RELIABLE) ============
 app.get('/api/file/:token', (req, res) => {
-  // CORS
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', '*');
-  res.setHeader('Access-Control-Expose-Headers', '*');
 
   const rec = tempFiles.get(req.params.token);
   if (!rec) return res.status(404).send('File not found');
@@ -158,8 +156,6 @@ app.get('/api/file/:token', (req, res) => {
   }
   if (!fs.existsSync(rec.path)) return res.status(404).send('File gone');
 
-  // Use express res.download — sets Content-Disposition properly
-  // DON'T delete file — allows retry. Cleanup via interval.
   res.download(rec.path, rec.name, (err) => {
     if (err) console.error('Download err:', err.message);
   });
